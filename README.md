@@ -21,13 +21,16 @@
     </td>
   </tr>
 </table>
----
+
+# SEMICON India Hackathon 2026: Team OOMSurvivors
 
 ## Project Overview
 
-**Phase 1 Submission for the SEMICON India Hackathon 2026.**
+**Phase 2 Submission for the SEMICON India Hackathon 2026.**
 
 This project is an AI-based restoration pipeline performing **joint denoising and 2× spatial resolution recovery** on signal-degraded grayscale semiconductor inspection images. It utilizes a custom NAFNet-style U-Net architecture featuring a 2x pixel-shuffle upsampler with a bilinear-upsample residual shortcut.
+
+Our final Gen 5 "Vanilla" model achieves a **23.86 dB PSNR** and runs at **10.94 ms/img**, successfully balancing high-fidelity regression with production-grade throughput without relying on hallucination-prone generative architectures.
 
 Every path is config-driven. Nothing requires a source edit — a hard requirement of the KLA spec (section 4C).
 
@@ -35,12 +38,16 @@ Every path is config-driven. Nothing requires a source edit — a hard requireme
 
 ## Quick Start & Setup
 
-**No internet access, API keys, or additional downloads are required at inference time.** The `models/best_nafnet.pt` checkpoint contains everything the model needs.
+**No internet access, API keys, or additional downloads are required at inference time.** The `weights/best_nafnet.pt` checkpoint contains everything the model needs, tracked via Git LFS.
 
 ```bash
 # Clone the repository
-git clone https://github.com/GadiMahi/oomsurvivors.git
-cd oomsurvivors
+git clone https://github.com/RK-NerdyBirdy/OOMSurvivors.git
+cd OOMSurvivors
+
+# CRITICAL: Pull the actual weights (resolves PyTorch unpickling errors)
+git lfs install
+git lfs pull
 
 # Set up a virtual environment (optional but recommended)
 python -m venv .venv && source .venv/bin/activate
@@ -54,7 +61,7 @@ pip install -r requirements.txt
 
 ## Running Inference
 
-The `run.py` script is the mandatory evaluation entry point. It is fully self-contained and fixes previous registry bugs so the "nafnet" architecture resolves perfectly.
+The `run.py` script is the mandatory evaluation entry point. It is fully self-contained, includes mixed-precision fallback (autocast), and utilizes background thread prefetching for maximum GPU saturation.
 
 ```bash
 python run.py <input_dir> <output_dir>
@@ -69,29 +76,30 @@ python run.py <input_dir> <output_dir>
 * **Format:** One `.npy` per input, same base filename.
 * **Shape:** Grayscale, shape `(H, W)` or `(H, W, 1)` (matches the input's ndim).
 * **Data Type:** `float32`, values clamped strictly to `[0, 1]`, with no `NaN/Inf` (defensively sanitized with `np.nan_to_num` on both the read and write sides).
-* **Resolution:** Spatial resolution is restored at a fixed **2x super-resolution factor** (e.g., 128→256 or 256→512), matching the training config (`dataset.scale = 2`).
-* **Dynamic Sizing:** Inputs are batched and grouped by shape for efficient, fully batched GPU execution. Height/width are reflect-padded to a multiple of 2 internally (required by the stride-2 U-Net level) and seamlessly cropped back after upsampling, supporting arbitrary input sizes.
+* **Resolution:** Spatial resolution is restored at a fixed **2x super-resolution factor** (e.g., 128→256 or 256→512), matching the training config.
+* **Dynamic Sizing:** Inputs are batched and grouped by shape for efficient, fully batched GPU execution. Height/width are reflect-padded to a multiple of 4 internally (required by the `levels=2` U-Net depth) and seamlessly cropped back after upsampling, supporting arbitrary input sizes.
 
 ---
 
 ## Model Architecture & Training
 
-**Architecture:** `NAFNet_UNet (in_channels=1, out_channels=1, dim=64, scale=2)`
+**Architecture:** `NAFNet_UNet (in_channels=1, out_channels=1, dim=48, scale=2, levels=2, non_local=False)`
 
-* **Flow:** Intro conv → 2 NAFBlocks → stride-2 down → 2 NAFBlocks (bottleneck) → 2 NAFBlocks (middle) → PixelShuffle(2) up → concat skip → reduce → 2 NAFBlocks → PixelShuffle(2) SR tail.
+* **Flow:** Intro conv → 2 NAFBlocks → stride-2 down (Level 1) → 2 NAFBlocks → stride-2 down (Level 2) → 2 NAFBlocks (bottleneck) → PixelShuffle(2) up → concat skip → reduce → 2 NAFBlocks → PixelShuffle(2) up → concat skip → reduce → 2 NAFBlocks → PixelShuffle(2) SR tail.
+* **FP32 Variance Fix:** `LayerNorm2d` operations are forced into FP32 to prevent division-by-zero underflow and eliminate checkerboard grid artifacts on older GPUs (like the T4).
 * **Shortcut:** A bilinear-upsampled input is added back at the end as a residual shortcut to preserve global structure.
 
 **Training Details:**
-Trained with a carefully balanced, multi-objective weighted loss to prevent edge blurring:
-`1.0 * Charbonnier + 0.05 * LPIPS(vgg) + 0.5 * Sobel-edge L1`
+Trained with a carefully balanced, multi-objective weighted loss to prevent edge blurring while maintaining regression accuracy:
+`1.0 * Charbonnier + 0.05 * LPIPS(vgg) + 0.5 * Sobel-edge L1 + Spectral Loss`
 
-*(See the `train_nafnet.py` script for the full training loop, loss functions, AdamW optimizer, Cosine Annealing scheduler, and OOD validation via `stratified_ssim`.)*
+*(See the `train.py` script for the full training loop, L1/MSE loss functions, AdamW optimizer, and Cosine Annealing scheduler.)*
 
 ---
 
 ## Data Pipeline & Reproducing Training
 
-To reproduce the training pipeline from scratch (e.g., on Kaggle), follow these exact steps. The data pipeline is designed to be highly memory-efficient, utilizing memory mapping (`mmap`) to prevent RAM exhaustion.
+To reproduce the training pipeline from scratch (e.g., on Kaggle or Colab), follow these exact steps. The data pipeline is designed to be highly memory-efficient, utilizing memory mapping (`mmap`) to prevent RAM exhaustion.
 
 ```bash
 export DATA="/kaggle/input/<dataset-slug>"
@@ -106,7 +114,7 @@ python scripts/make_cache.py --set data.root=$DATA cache.dir=/kaggle/working/cac
 python scripts/make_splits.py --set data.root=$DATA
 
 # 4. Train the Model
-python train_nafnet.py --set data.root=$DATA cache.dir=/kaggle/working/cache output.dir=/kaggle/working/artifacts
+python train.py --set data.root=$DATA cache.dir=/kaggle/working/cache output.dir=/kaggle/working/artifacts
 
 ```
 
@@ -122,5 +130,5 @@ python train_nafnet.py --set data.root=$DATA cache.dir=/kaggle/working/cache out
 | **Gradient-based crop rejection sampling** | Wafer images are mostly flat die area; uniform random crops waste training on blank regions. |
 | **Augmentation prioritises content over noise** | Test set OOD contains unfamiliar *image content*, not unfamiliar degradations. Jitter range rescales GT before degrading. |
 | **Noise jitter kept modest (±30%)** | "Noise mechanisms remain the same; sampled levels may vary within a similar range" — over-widening makes the model hedge and blur. |
-| **Per-stage timing in `inference.py**` | Runtime "includes disk reading, preprocessing, CPU-to-GPU transfer, model execution, GPU-to-CPU transfer, post-processing and saving." |
+| **Per-stage timing in `run.py**` | Runtime "includes disk reading, preprocessing, CPU-to-GPU transfer, model execution, GPU-to-CPU transfer, post-processing and saving." |
 | **No hardcoded paths; seeds fixed** | "Training & compute hygiene" is a directly scored evaluation axis. |
