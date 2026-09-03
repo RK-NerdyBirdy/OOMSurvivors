@@ -1,0 +1,224 @@
+# Single source of truth for paths and hyperparameters.
+# Evaluators must never need to edit source code (KLA spec, section 4C).
+# Override any value from the CLI:  --set data.root=/kaggle/input/kla-data
+
+data:
+  # Round 2: /kaggle/input/<slug>/semicon_train_data
+  # Round 1: /kaggle/input/kla-dataset
+  root: /kaggle/input/semicon-round2/semicon_train_data
+  gt_subdir: GT
+  lr_subdir: NoisyLR
+  # Leave null to auto-detect from the files themselves.
+  file_glob: null
+  # Round 2 ships 4,785 GT against 1,325 pairs. The mismatch is INTENTIONAL:
+  # the unpaired clean images are meant to be degraded synthetically.
+  expect_unequal_counts: true
+
+io:
+  # All auto-detected by scripts/run_inventory.py, then frozen here.
+  # Output MUST match GT format exactly - KLA scores images as saved.
+  output_format: null      # 'npy' | 'tiff32' | 'png16' | 'png8'
+  output_dtype: null
+  output_suffix: null
+
+cache:
+  dir: /kaggle/working/cache
+  gt_dtype: float32        # float32 | uint16  (never float16)
+  lr_dtype: float32        # LR exceeds [0,1]; keep float32
+
+dataset:
+  lr_patch: 64             # HR patch = lr_patch * scale
+  scale: 2
+  grad_percentile: 40      # measured on the CLEAN GT patch, not the noisy LR
+  grad_thresh: 0.1222      # round-2 GT p40; null => measure at runtime
+  crop_tries: 8
+  use_gt_only: true        # include the 3,460 unpaired clean images
+  real_frac: 0.30          # share of REAL pairs per epoch; null => natural 28%
+  synth_p: 0.0             # extra chance a PAIRED item is synthesised instead
+
+degrade:
+  width: 1.0               # curriculum knob, ramp 0.3 -> 1.0
+  # Kernel IDENTIFIED by spectral + autocorrelation matching (not low-pass MSE,
+  # which discards exactly the band where kernels differ and wrongly concluded
+  # "unidentifiable" in round 1). KLA's downsample is partial antialiasing:
+  # Gaussian blur sigma~0.6 then decimate.
+  #
+  #   kernel      ac diff   lv ratio   score
+  #   decimate    -0.0864     1.159    0.6091
+  #   gauss:0.5   -0.0182     1.045    0.3749
+  #   gauss:0.6   +0.0113     1.004    0.2400  <- best
+  #   gauss:0.7   +0.0278     0.971    0.2799
+  #   area        +0.0500     0.947    0.3334
+  #
+  # Two independent statistics (pixel autocorrelation and local texture energy)
+  # both cross their target between sigma 0.5 and 0.6. Narrow jitter retained
+  # for robustness; bicubic_aa and lanczos removed - they destabilise the
+  # variance fit and were the main source of the synthetic/real mismatch.
+  kernels: ["gauss:0.5", "gauss:0.6", "gauss:0.7"]
+  kernel_p: [0.25, 0.50, 0.25]
+  order_mix: [0.1, 0.9]    # [noise_first, noise_last]; autocorr ~0 => noise last
+  meas_mult: 0.1583        # round 1 was 0.1431
+  meas_add: 0.0
+  jitter: 0.30             # +/- fraction. KLA: levels vary "within a similar range"
+  # Empirical residual resampling. Round-2 noise is right-skewed (+0.55) with
+  # excess kurtosis ~1.4; a Gaussian generator gives ~6x too few 5-sigma
+  # outliers. Build with scripts/build_residual_bank.py.
+  residual_bank: artifacts/residual_bank.npz
+  curriculum: [0.3, 1.0]   # degradation-variety ramp from first to last epoch
+
+augment:
+  scale_jitter: [0.7, 1.4]   # applied to GT BEFORE degrading; only defence
+                             # against 512x512 evaluation content
+  d4: true                   # free; SEM texture has no preferred orientation
+  cutblur_p: 0.5             # replaces a patch of the noisy input with a clean
+                             # downsample, so the model learns WHERE to restore
+
+split:
+  # Split ONLY the real pairs. Unpaired GT all goes to training - it cannot be
+  # validated against, having no real degraded counterpart.
+  n_clusters: 6
+  ood_cluster: null      # null => auto-pick the largest cluster under max_ood_frac
+  val_frac: 0.1
+  max_ood_frac: 0.25     # OOD cluster must be big enough to be a reliable metric
+  min_ood_n: 80          # round-2 cluster sizes: 47/183/88/127/71/84 (per 600)
+  seed: 1337
+
+# Reference numbers for round-2 comparisons. Round-1 scores are NOT comparable:
+# that dataset was natural photographs and roughly 2.2 dB easier.
+baseline:
+  bicubic:
+    psnr: 20.4706
+    ssim: 0.5079
+    ssim_edge: 0.5964
+    ssim_flat: 0.4784
+    lpips: 0.4839
+
+model:
+  name: nafnet
+  dim: 64                # channel width. params ~ dim^2. Round-2 finding:
+                         # dim 64 -> 96 gained +0.003 SSIM and no PSNR, so
+                         # capacity was NOT the constraint.
+  levels: 1              # U-Net depth = number of stride-2 stages.
+                         # Controls RECEPTIVE FIELD, which width does not.
+                         #   1 -> ~30px  (round-2 baseline)
+                         #   2 -> ~70px
+                         #   3 -> ~150px (exceeds the 128px training patch)
+                         # Input must be divisible by 2**levels.
+  # Non-local (self-attention) block at the bottleneck. OFF by default.
+  #
+  # Convolution can only see ~60px at levels=2, but SEM texture repeats across
+  # the whole frame. scripts/measure_recurrence.py measured the redundancy on
+  # all 4,785 pairs:
+  #     single noisy patch                 20.08 dB
+  #     avg of 16 spatial neighbours       21.54 dB  (+1.46)
+  #     avg of 16 MATCHED patches          23.42 dB  (+3.34)
+  #     avg of 16 patches, DIFFERENT image 18.09 dB  (-1.99)  <- control
+  # Oracle matching caps at +4.13 dB, and practical is only 0.79 dB behind it,
+  # so matches stay findable under noise.
+  #
+  # This is the one lever that adds INFORMATION rather than capacity - the
+  # category that failed every previous time (wider, deeper, spectral loss).
+  # It is spatial frame averaging: the same statistics that make repeated scans
+  # work, gathered from one frame instead of many.
+  #
+  # Expect ~2x noise reduction, not 16x: SEM texture recurs approximately.
+  # Attention is detected from the checkpoint, so run.py needs no flag.
+  non_local: false
+  nl_heads: 4
+  nl_kv_stride: 2        # pool keys/values by this factor. 1 = full attention
+                         # (accurate, but memory grows with the square of the
+                         # pixel count and 512px inputs become a problem).
+                         # 2 quarters the cost and keeps queries full-resolution.
+  blocks: 2              # NAFBlocks per encoder/decoder level
+  middle_blocks: 2       # NAFBlocks in the bottleneck
+                         # NOTE: pre-`levels` checkpoints are structurally
+                         # levels=1, blocks=2, middle_blocks=4. run.py detects
+                         # and remaps them automatically.
+                         #
+                         # width reference: 48 -> 0.55M | 64 -> 0.98M
+                         #                  96 -> 2.2M  | 128 -> 3.9M
+                         # inference time is scored - measure, don't assume.
+
+train:
+  seed: 1337
+  batch_size: 32
+  val_batch_size: 8
+  num_workers: 4        # Kaggle CPU allowance; 8 triggers a warning
+  epochs: 80            # round-1 runs plateaued around epoch 50-60
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  amp: true             # T4 has tensor cores; roughly 2x throughput
+  grad_clip: 1.0
+  lpips_net: vgg        # round-1: vgg-trained model beat the alex-trained one
+  select_metric: ssim   # checkpoint on OOD ssim; all metrics are logged
+  output_dir: artifacts
+  swa_start: 0          # epoch to begin stochastic weight averaging. 0 = off.
+                        # Averages weights across the plateau instead of picking
+                        # one epoch. Same family as TTA and ensembling - reduces
+                        # random error rather than trying to extract more signal,
+                        # which is the category that works on this problem.
+                        # 36 is the measured start of the plateau (epochs 36-50
+                        # of the final run were within 0.0008 SSIM). The SWA
+                        # model is evaluated and compared against the best
+                        # single checkpoint before you decide which to submit.
+
+loss:
+  charbonnier: 1.0
+  lpips: 0.05           # too high and it fights pixel fidelity
+  edge: 0.5
+  edge_weight_alpha: 4.0   # per-pixel Charbonnier weighting toward structure
+  spectral: 0.0            # frequency-domain loss. 0 = off. TESTED AND REJECTED.
+                           # The motivation was sound: the dim96 model retained
+                           # only 28% of the ground truth's high-frequency power.
+                           # Run 5 set this to 3.0 and the result was:
+                           #     PSNR  23.46  (baseline 23.94)
+                           #     SSIM  0.4899 (baseline 0.5034)
+                           #     LPIPS 0.3699 (baseline 0.3655)
+                           # Worse on every metric. HF retention did rise to 72%,
+                           # but the images looked no better - it added
+                           # high-frequency ENERGY without high-frequency
+                           # STRUCTURE. Matching FFT magnitude manufactures grain
+                           # that corresponds to nothing.
+                           # Do not re-run this expecting it to fix blur.
+  spectral_hi_from: 0.25   # only penalise the upper 75% of the spectrum
+  gt_smooth_sigma: 0.0     # Gaussian blur applied to the LOSS TARGET only. 0 = off.
+                           # Rationale: the ground truth carries its own
+                           # acquisition noise (tail flatness 0.024), which is
+                           # unpredictable, so asking the model to reproduce it
+                           # only adds gradient noise.
+                           # Risk: the model output ALREADY matches GT blurred
+                           # at sigma~1.1 by 4.3 dB more than raw GT, so blurring
+                           # the target pushes further in the direction that is
+                           # already the deficit - while scoring stays against
+                           # RAW GT. Start at 0.3-0.5, not 1.0, and check PSNR.
+  ms_ssim: 0.0             # multi-scale SSIM loss. 0 = off.
+                           # SSIM is the metric KLA scores and the one we
+                           # select checkpoints on, but no run has ever trained
+                           # on it directly. Its contrast/structure terms
+                           # compare local statistics rather than raw pixels,
+                           # which is what the "texture read as noise" problem
+                           # actually calls for. Try 0.2-0.5 and watch PSNR,
+                           # which it will cost something.
+
+# Generalised Anscombe variance-stabilising transform. OFF by default.
+# Derived from the measured fit var(y) = a*y^2 + b*y + c, so it needs no new
+# constants - see src/vst.py for the algebra and `python -m src.vst` to verify.
+#
+# WHAT IT FIXES: bright pixels carry ~12x the noise variance of dark ones, but
+# Charbonnier weights every pixel equally, so the loss is dominated by bright
+# regions purely because they are noisier. In stabilised space noise std is
+# constant (measured: 3.08x spread -> 1.02x), so the loss balances properly.
+#
+# A checkpoint trained with this MUST be run with it. train.py writes the flag
+# into the checkpoint and run.py reads it back, so no manual step is needed.
+vst:
+  enabled: false
+  normalize: true          # rescale so f(0)=0 and f(1)=1, keeping the network
+                           # in the [0,1]-ish range its other hyperparameters
+                           # were tuned for. Affine, so stabilisation is intact.
+
+inference:
+  batch_size: 8
+  device: cuda
+  amp: true
+  pad_multiple: null      # unused: run.py computes 2**levels from the checkpoint
