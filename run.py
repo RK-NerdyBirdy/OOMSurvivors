@@ -147,10 +147,10 @@ def main() -> int:
     ap.add_argument("--dim", type=int, default=48, help="Model width (default: 48)")
     ap.add_argument("--levels", type=int, default=2, help="U-Net depth (default: 2)")
     ap.add_argument("--tta", type=int, default=1, choices=[1, 2, 4, 8], help="TTA passes")
-    ap.add_argument("--compile", type=int, default=1, choices=[0, 1],
-                     help="Attempt torch.compile on CUDA, with automatic eager fallback (default: 1)")
-    ap.add_argument("--channels_last", type=int, default=1, choices=[0, 1],
-                     help="Use channels_last memory format on CUDA (default: 1)")
+    ap.add_argument("--compile", type=int, default=0, choices=[0, 1],
+                     help="Attempt torch.compile on CUDA (default: 0 for max compatibility)")
+    ap.add_argument("--channels_last", type=int, default=0, choices=[0, 1],
+                     help="Use channels_last memory format on CUDA (default: 0 for max compatibility)")
     ap.add_argument("--prefetch", type=int, default=2,
                      help="Batches to prefetch ahead on a background thread (default: 2)")
     args = ap.parse_args()
