@@ -1,217 +1,170 @@
 #!/usr/bin/env python3
-"""
-Standalone evaluation script — KLA AI Hackathon submission.
-Team: OOM Survivors
-
-Usage:
-    python run.py <input_dir> <output_dir> [--gt_dir <gt_dir>]
-
-Behavior:
-  * Reads every .npy file in <input_dir> (degraded / low-res images).
-  * Restores each one with the trained NAFNet super-resolution model.
-  * Writes one restored .npy file per input to <output_dir>.
-  * If Ground Truth is available, computes and prints PSNR, SSIM, and LPIPS.
-"""
-from __future__ import annotations
-
 import argparse
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
-# Make the local `src` package importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from src.model import build_model, is_legacy_state_dict, remap_legacy_state_dict  # noqa: E402
-from src.tta import tta_forward   # noqa: E402
-
-SCALE = 2
-
-BASE_DIR = Path(__file__).resolve().parent
-WEIGHTS_PATH = BASE_DIR / "weights" / "best_nafnet.pt"
-FALLBACK_WEIGHTS = BASE_DIR / "artifacts" / "best_nafnet.pt"
-
+from src.model import build_model
 
 def pad_to_multiple(x: torch.Tensor, m: int):
-    """Reflect-pad the last two dims of x up to the next multiple of m."""
-    if m <= 1:
-        return x, (0, 0)
+    if m <= 1: return x, (0, 0)
     h, w = x.shape[-2:]
     ph, pw = (-h) % m, (-w) % m
-    if ph or pw:
-        x = F.pad(x, (0, pw, 0, ph), mode="reflect")
+    if ph or pw: x = F.pad(x, (0, pw, 0, ph), mode="reflect")
     return x, (ph, pw)
 
-
 def load_npy(path: Path):
-    """Load a .npy file and return (2D float32 array, original_ndim)."""
     arr = np.load(path).astype(np.float32)
     orig_ndim = arr.ndim
-    if arr.ndim == 3:
-        arr = arr[..., 0] if arr.shape[-1] == 1 else arr.mean(axis=-1)
-    elif arr.ndim != 2:
-        raise ValueError(
-            f"Unexpected array shape {arr.shape} for {path.name}; expected (H,W) or (H,W,1)"
-        )
-    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
-    return arr, orig_ndim
+    if arr.ndim == 3: arr = arr[..., 0] if arr.shape[-1] == 1 else arr.mean(axis=-1)
+    return np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0), orig_ndim
 
+# --- 1. Optimized Background Data Loader ---
+class SEMDataset(Dataset):
+    def __init__(self, file_list, gt_dir=None, levels=2):
+        self.files = file_list
+        self.gt_dir = gt_dir
+        self.levels = levels
+        self.pad_mult = 2 ** levels
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input_dir", type=str, help="Directory containing degraded .npy images")
-    ap.add_argument("output_dir", type=str, help="Directory to write restored .npy images")
-    ap.add_argument("--gt_dir", type=str, default=None, help="Optional directory containing GT .npy images for metrics")
-    ap.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
-    ap.add_argument("--weights", type=str, default=None, help="Checkpoint path")
-    ap.add_argument("--dim", type=int, default=48, help="Model width (default: 48)")
-    ap.add_argument("--levels", type=int, default=2, help="U-Net depth (default: 2)")
-    ap.add_argument("--tta", type=int, default=1, choices=[1, 2, 4, 8], help="TTA passes")
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        f = self.files[idx]
+        lr_arr, orig_ndim = load_npy(f)
+        lr_tensor = torch.from_numpy(lr_arr).unsqueeze(0) # (1, H, W)
+        lr_padded, (ph, pw) = pad_to_multiple(lr_tensor, self.pad_mult)
+        
+        gt_arr = np.array([], dtype=np.float32)
+        if self.gt_dir:
+            gt_path = self.gt_dir / f.name
+            if gt_path.exists():
+                gt_arr, _ = load_npy(gt_path)
+
+        return lr_padded, torch.from_numpy(gt_arr), str(f.name), orig_ndim, ph, pw
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input_dir", type=str)
+    ap.add_argument("output_dir", type=str)
+    ap.add_argument("--gt_dir", type=str, default=None)
+    ap.add_argument("--batch_size", type=int, default=8) # Increased default for batching!
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--compile", action="store_true", help="Enable torch.compile for H100")
     args = ap.parse_args()
 
-    in_dir = Path(args.input_dir)
-    out_dir = Path(args.output_dir)
+    in_dir, out_dir = Path(args.input_dir), Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if not in_dir.is_dir():
-        print(f"ERROR: input directory not found: {in_dir}")
-        return 2
-
-    # Check for Ground Truth directory
     gt_dir = Path(args.gt_dir) if args.gt_dir else None
-    if gt_dir is None:
-        potential_gt = in_dir.parent / "GT"
-        if potential_gt.is_dir():
-            gt_dir = potential_gt
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     files = sorted(in_dir.glob("*.npy"))
-    if not files:
-        print(f"No .npy files found in {in_dir}")
-        return 2
+    
+    # Initialize Vanilla Model
+    model = build_model("nafnet", scale=2, dim=48, levels=2, non_local=False).to(device)
+    weights_path = Path("weights/best_nafnet.pt")
+    if not weights_path.exists(): weights_path = Path("artifacts/best_nafnet.pt")
+        
+    ckpt = torch.load(weights_path, map_location=device)
+    sd = {k.replace("module.", ""): v for k, v in ckpt.get("model", ckpt).items()}
+    model.load_state_dict(sd, strict=True)
+    model.eval()
 
-    # Determine weights path
-    if args.weights:
-        active_weights_path = Path(args.weights)
-    else:
-        active_weights_path = WEIGHTS_PATH if WEIGHTS_PATH.exists() else FALLBACK_WEIGHTS
+    # Hardware acceleration
+    if args.compile and hasattr(torch, "compile"):
+        print("🔥 Optimizing model with torch.compile()...")
+        model = torch.compile(model)
 
-    if not active_weights_path.exists():
-        print(f"ERROR: Weights checkpoint not found at {active_weights_path}")
-        return 2
-
-    ckpt = torch.load(active_weights_path, map_location=device)
-    state_dict = ckpt.get("model", ckpt)
-    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-
-    # Check for legacy names or infer configurations
-    dim = args.dim
-    levels = args.levels
-    blocks, mblocks = 2, 2
-
-    if is_legacy_state_dict(state_dict):
-        state_dict = remap_legacy_state_dict(state_dict)
-        levels, blocks, mblocks = 1, 2, 4
-        print("Legacy checkpoint detected -> levels=1, blocks=2, middle_blocks=4")
-
-    non_local = any(".to_kv." in k for k in state_dict)
-    if non_local:
-        mblocks = max(mblocks, sum(1 for k in state_dict if k.startswith("middle.") and k.endswith(".conv1.weight")))
-
-    # Build model
-    model = build_model("nafnet", scale=SCALE, dim=dim, levels=levels,
-                        blocks=blocks, middle_blocks=mblocks,
-                        non_local=non_local).to(device).eval()
-
-    model.load_state_dict(state_dict, strict=True)
-    n_par = sum(p.numel() for p in model.parameters())
-    print(f"Loaded weights: {active_weights_path} (dim={dim}, levels={levels}, {n_par/1e6:.2f}M params)")
-
-    # Prepare optional metric trackers
-    calculate_metrics = False
+    # Setup Metrics
+    calc_metrics = False
     if gt_dir and gt_dir.is_dir():
-        try:
-            from skimage.metrics import peak_signal_noise_ratio as psnr_metric
-            from skimage.metrics import structural_similarity as ssim_metric
-            import lpips
-            lpips_fn = lpips.LPIPS(net="vgg").to(device).eval()
-            for p in lpips_fn.parameters():
-                p.requires_grad = False
-            calculate_metrics = True
-            print(f"Ground Truth directory found at {gt_dir}. Metric evaluation enabled.")
-        except ImportError:
-            print("Dependencies for metrics (scikit-image, lpips) missing. Skipping metric calculation.")
+        from skimage.metrics import peak_signal_noise_ratio as psnr_metric
+        from skimage.metrics import structural_similarity as ssim_metric
+        import lpips
+        lpips_fn = lpips.LPIPS(net="vgg").to(device).eval()
+        for p in lpips_fn.parameters(): p.requires_grad = False
+        calc_metrics = True
+        total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
+        eval_count = 0
 
-    total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
-    evaluated_count = 0
+    dataset = SEMDataset(files, gt_dir, levels=2)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.workers, 
+        pin_memory=True # Keeps memory in fast pinned RAM for GPU transfers
+    )
 
-    # Group files by dimension for consistent batch sizes
-    t_start = time.perf_counter()
-    cache: dict[Path, tuple[np.ndarray, int]] = {}
-    by_shape: dict[tuple, list[Path]] = defaultdict(list)
-    for f in files:
-        arr, orig_ndim = load_npy(f)
-        cache[f] = (arr, orig_ndim)
-        by_shape[arr.shape].append(f)
-
-    n_done = 0
+    # Inference Loop
+    t_e2e_start = time.perf_counter()
+    forward_times = []
+    
+    # Warmup
     with torch.no_grad():
-        for shape, group in by_shape.items():
-            for i in range(0, len(group), args.batch_size):
-                chunk = group[i:i + args.batch_size]
-                batch_np = np.stack([cache[f][0] for f in chunk])[:, None, :, :]  # (B, 1, H, W)
-                x = torch.from_numpy(batch_np).to(device, non_blocking=True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            _ = model(torch.zeros(1, 1, 128, 128, device=device))
+            if device.type == "cuda": torch.cuda.synchronize()
 
-                xp, (ph, pw) = pad_to_multiple(x, 2 ** levels)
-                y = tta_forward(model, xp, args.tta, clamp=None) if args.tta > 1 else model(xp)
-                if ph or pw:
-                    y = y[..., : y.shape[-2] - ph * SCALE, : y.shape[-1] - pw * SCALE]
+    with torch.no_grad():
+        for lr_padded, gt_batch, fnames, orig_ndims, phs, pws in dataloader:
+            lr_padded = lr_padded.to(device, non_blocking=True)
+            
+            # Pure forward pass timing
+            if device.type == "cuda": torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            
+            # Automatic Mixed Precision for T4 & H100
+            with torch.autocast("cuda", dtype=torch.float16):
+                y = model(lr_padded)
+                
+            if device.type == "cuda": torch.cuda.synchronize()
+            # Append per-image time by dividing batch time by batch size
+            forward_times.append(((time.perf_counter() - t0) * 1000.0) / lr_padded.shape[0])
 
-                y = torch.clamp(y, 0.0, 1.0)
-                y_np = y.float().cpu().numpy()[:, 0]  # (B, H, W)
-                y_np = np.nan_to_num(y_np, nan=0.0, posinf=1.0, neginf=0.0)
+            y = torch.clamp(y, 0.0, 1.0)
+            
+            for i in range(lr_padded.shape[0]):
+                ph, pw = phs[i].item(), pws[i].item()
+                out_tensor = y[i]
+                if ph or pw: 
+                    out_tensor = out_tensor[..., : out_tensor.shape[-2] - ph * 2, : out_tensor.shape[-1] - pw * 2]
+                
+                out_arr = out_tensor.cpu().numpy()[0]
+                save_arr = out_arr[..., None] if orig_ndims[i].item() == 3 else out_arr
+                np.save(out_dir / fnames[i], save_arr.astype(np.float32))
 
-                for f, out_arr in zip(chunk, y_np):
-                    _, orig_ndim = cache[f]
-                    save_arr = out_arr[..., None] if orig_ndim == 3 else out_arr
-                    np.save(out_dir / f.name, save_arr.astype(np.float32))
-                    n_done += 1
+                if calc_metrics and gt_batch[i].numel() > 0:
+                    gt_arr = gt_batch[i].numpy()
+                    total_psnr += psnr_metric(gt_arr, out_arr, data_range=1.0)
+                    total_ssim += ssim_metric(gt_arr, out_arr, data_range=1.0)
+                    p_norm = torch.from_numpy(out_arr)[None, None, ...].to(device).repeat(1, 3, 1, 1) * 2 - 1
+                    g_norm = torch.from_numpy(gt_arr)[None, None, ...].to(device).repeat(1, 3, 1, 1) * 2 - 1
+                    total_lpips += float(lpips_fn(p_norm, g_norm).item())
+                    eval_count += 1
 
-                    # Optional metric calculation
-                    if calculate_metrics:
-                        gt_path = gt_dir / f.name
-                        if gt_path.exists():
-                            gt_arr, _ = load_npy(gt_path)
-                            total_psnr += psnr_metric(gt_arr, out_arr, data_range=1.0)
-                            total_ssim += ssim_metric(gt_arr, out_arr, data_range=1.0)
-
-                            pred_t = torch.from_numpy(out_arr).unsqueeze(0).unsqueeze(0).to(device)
-                            gt_t = torch.from_numpy(gt_arr).unsqueeze(0).unsqueeze(0).to(device)
-                            p_norm = pred_t.repeat(1, 3, 1, 1) * 2.0 - 1.0
-                            g_norm = gt_t.repeat(1, 3, 1, 1) * 2.0 - 1.0
-                            total_lpips += float(lpips_fn(p_norm, g_norm).item())
-                            evaluated_count += 1
-
-    elapsed = time.perf_counter() - t_start
-    print(f"\nRestored {n_done}/{len(files)} images -> {out_dir}")
-    print(f"device={device}  elapsed={elapsed:.3f}s  ({1000 * elapsed / max(n_done, 1):.2f} ms/img)")
-
-    if calculate_metrics and evaluated_count > 0:
-        print("\n" + "=" * 55)
-        print(f"METRICS OVER {evaluated_count} GROUND TRUTH IMAGES")
-        print("=" * 55)
-        print(f"PSNR : {total_psnr / evaluated_count:.4f} dB")
-        print(f"SSIM : {total_ssim / evaluated_count:.4f}")
-        print(f"LPIPS: {total_lpips / evaluated_count:.4f}")
-        print("=" * 55)
-
-    return 0
-
+    t_e2e_total = time.perf_counter() - t_e2e_start
+    
+    print("\n" + "=" * 60)
+    print("      HIGH-THROUGHPUT INFERENCE BENCHMARK SUMMARY")
+    print("=" * 60)
+    print(f"Total Images Processed : {len(files)}")
+    print(f"Total E2E Runtime      : {t_e2e_total:.3f} s")
+    print(f"Avg E2E Throughput     : {t_e2e_total / len(files) * 1000.0:.2f} ms / image")
+    print(f"Pure Forward Pass Time : {np.mean(forward_times):.2f} ± {np.std(forward_times):.2f} ms / image")
+    print("-" * 60)
+    if calc_metrics and eval_count > 0:
+        print(f"Evaluated GT Pairs     : {eval_count}")
+        print(f"Average PSNR (↑)       : {total_psnr / eval_count:.4f} dB")
+        print(f"Average SSIM (↑)       : {total_ssim / eval_count:.4f}")
+        print(f"Average LPIPS (↓)      : {total_lpips / eval_count:.4f}")
+    print("=" * 60)
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
